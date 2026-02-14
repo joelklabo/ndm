@@ -14,20 +14,9 @@ import (
 )
 
 var (
-	version   = "0.1.0"
-	appName   = "ndm"
-	appDesc   = "Send Nostr Direct Messages (NIP-17) from the command line"
-	usageText = `
-A simple, reliable CLI tool for sending encrypted direct messages on Nostr.
-
-EXAMPLES:
-  ndm -k nsec1... -r npub1... -m "Hello!"
-  ndm --key nsec1... --recipient npub1... --message "Secret message"
-  ndm -k <(cat ~/nsec) -r npub1... -m "Message from file"
-  ndm -k nsec1... -r npub1... -m "Message" -relay wss://relay.damus.io
-
-FULL OPTIONS:
-`
+	version       = "0.1.0"
+	appName       = "ndm"
+	appDesc       = "Send Nostr Direct Messages (NIP-17) from the command line"
 	defaultRelays = []string{
 		"wss://relay.damus.io",
 		"wss://relay.nostr.band",
