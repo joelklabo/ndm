@@ -112,7 +112,9 @@ func parseArgs(args []string) (*options, error) {
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("missing value for -n")
 			}
-			fmt.Sscanf(args[i+1], "%d", &opts.count)
+			if _, err := fmt.Sscanf(args[i+1], "%d", &opts.count); err != nil {
+				return nil, fmt.Errorf("invalid count: %w", err)
+			}
 			i++
 		case "-relay", "--relays":
 			if i+1 >= len(args) {
@@ -125,7 +127,9 @@ func parseArgs(args []string) (*options, error) {
 				return nil, fmt.Errorf("missing value for -t")
 			}
 			var t int
-			fmt.Sscanf(args[i+1], "%d", &t)
+			if _, err := fmt.Sscanf(args[i+1], "%d", &t); err != nil {
+				return nil, fmt.Errorf("invalid timeout: %w", err)
+			}
 			opts.wait = time.Duration(t) * time.Second
 			i++
 		case "-v", "--verbose":
