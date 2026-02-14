@@ -1,28 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/nbd-wtf/go-nostr/nip44"
 )
 
-var (
-	version       = "0.1.0"
-	appName       = "ndm"
-	appDesc       = "Send Nostr Direct Messages (NIP-17) from the command line"
-	defaultRelays = []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://nos.lol",
-	}
-)
+var version = "0.3.0"
 
 type options struct {
 	key        string
@@ -32,91 +23,230 @@ type options struct {
 	wait       time.Duration
 	verbose    bool
 	jsonOutput bool
+	count      int
+	read       bool
 }
 
 func printHelp() {
-	fmt.Fprintf(os.Stderr, `%s (%s) - %s
+	fmt.Fprintf(os.Stderr, `ndm (%s) - Send and Read Nostr Direct Messages (NIP-17)
 
 USAGE:
-  %s [OPTIONS]
+  ndm send -k <key> -r <recipient> -m <message>
+  ndm read -k <key> [-n <count>]
+
+COMMANDS:
+  send    Send a direct message (default)
+  read    Read received messages
+  inbox   Same as read
 
 OPTIONS:
-  -k, --key <nsec>         Your private key (nsec, ncryptsec, or hex format) [required]
-  -r, --recipient <pubkey> Recipient's public key (npub, hex, or npub1... bech32) [required]
-  -m, --message <text>    The message to send [required]
+  -k, --key <nsec>         Your private key (nsec or hex) [required for send]
+  -r, --recipient <pubkey> Recipient's public key (npub, hex, or nsec) [required for send]
+  -m, --message <text>    The message to send [required for send]
+  -n, --count <num>       Number of messages to read (default: 10)
   -relay, --relays <urls> Comma-separated relay URLs (default: uses well-known relays)
-  -t, --timeout <sec>     How long to wait for publish confirmation (default: 30)
+  -t, --timeout <sec>    How long to wait for publish confirmation (default: 30)
   -v, --verbose           Print verbose output
   -j, --json              Output result as JSON
-  -h, --help              Show this help message
+  -h, --help              Show help
   --version               Show version number
 
-EXIT CODES:
-  0   Success
-  1   Invalid arguments or other error
-  2   Failed to encrypt message
-  3   Failed to sign event
-  4   Failed to publish to all relays
+EXAMPLES:
+  ndm send -k <nsec> -r <npub> -m "Hello!"
+  ndm read -k <nsec>
+  ndm read -k <nsec> -n 5
 
-For more info: https://github.com/klabo/ndm
-`, appName, version, appDesc, appName)
+NOTES:
+  - Recipient can be an npub, nsec (will derive pubkey), or hex pubkey
+  - If you use your own nsec as recipient, it sends to yourself
+
+`, version)
 }
 
 func parseArgs(args []string) (*options, error) {
 	opts := &options{
-		wait: 30 * time.Second,
+		wait:  30 * time.Second,
+		count: 10,
 	}
 
-	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	fs.Usage = func() {}
-
-	fs.StringVar(&opts.key, "k", "", "")
-	fs.StringVar(&opts.key, "key", "", "")
-	fs.StringVar(&opts.recipient, "r", "", "")
-	fs.StringVar(&opts.recipient, "recipient", "", "")
-	fs.StringVar(&opts.message, "m", "", "")
-	fs.StringVar(&opts.message, "message", "", "")
-	fs.StringVar(&opts.relays, "relay", "", "")
-	fs.StringVar(&opts.relays, "relays", "", "")
-	fs.DurationVar(&opts.wait, "t", 30*time.Second, "")
-	fs.DurationVar(&opts.wait, "timeout", 30*time.Second, "")
-	fs.BoolVar(&opts.verbose, "v", false, "")
-	fs.BoolVar(&opts.verbose, "verbose", false, "")
-	fs.BoolVar(&opts.jsonOutput, "j", false, "")
-	fs.BoolVar(&opts.jsonOutput, "json", false, "")
-
-	if err := fs.Parse(args); err != nil {
-		return nil, fmt.Errorf("failed to parse arguments: %w", err)
+	// Check for command
+	command := "send"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		command = args[0]
+		args = args[1:]
 	}
 
-	if opts.key == "" {
-		return nil, errors.New("missing required flag: -k/--key (your private key)")
+	if command == "read" || command == "inbox" {
+		opts.read = true
 	}
-	if opts.recipient == "" {
-		return nil, errors.New("missing required flag: -r/--recipient (recipient's public key)")
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		switch arg {
+		case "-h", "--help":
+			printHelp()
+			os.Exit(0)
+		case "--version":
+			fmt.Printf("ndm version %s\n", version)
+			os.Exit(0)
+		case "-k", "--key":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -k")
+			}
+			opts.key = args[i+1]
+			i++
+		case "-r", "--recipient":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -r")
+			}
+			opts.recipient = args[i+1]
+			i++
+		case "-m", "--message":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -m")
+			}
+			opts.message = args[i+1]
+			i++
+		case "-n", "--count":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -n")
+			}
+			fmt.Sscanf(args[i+1], "%d", &opts.count)
+			i++
+		case "-relay", "--relays":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for --relays")
+			}
+			opts.relays = args[i+1]
+			i++
+		case "-t", "--timeout":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -t")
+			}
+			var t int
+			fmt.Sscanf(args[i+1], "%d", &t)
+			opts.wait = time.Duration(t) * time.Second
+			i++
+		case "-v", "--verbose":
+			opts.verbose = true
+		case "-j", "--json":
+			opts.jsonOutput = true
+		}
 	}
-	if opts.message == "" {
-		return nil, errors.New("missing required flag: -m/--message (the message to send)")
+
+	if opts.read {
+		if opts.key == "" {
+			return nil, fmt.Errorf("missing required flag: -k/--key (your private key)")
+		}
+	} else {
+		if opts.key == "" {
+			return nil, fmt.Errorf("missing required flag: -k/--key (your private key)")
+		}
+		if opts.recipient == "" {
+			return nil, fmt.Errorf("missing required flag: -r/--recipient (recipient's public key)")
+		}
+		if opts.message == "" {
+			return nil, fmt.Errorf("missing required flag: -m/--message (the message to send)")
+		}
 	}
 
 	return opts, nil
 }
 
-type publishResult struct {
-	URL    string `json:"url"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+func resolveKey(input string) (string, error) {
+	input = strings.TrimSpace(input)
+
+	if len(input) == 64 && isHex(input) {
+		_, err := derivePublicKeyFromPrivate(input)
+		if err == nil {
+			return derivePublicKeyFromPrivate(input)
+		}
+		return input, nil
+	}
+
+	if strings.HasPrefix(input, "nsec") {
+		prefix, value, _ := nip19.Decode(input)
+		if prefix == "nsec" {
+			secret, ok := value.(string)
+			if ok {
+				return derivePublicKeyFromPrivate(secret)
+			}
+		}
+	}
+
+	if strings.HasPrefix(input, "npub") {
+		prefix, value, _ := nip19.Decode(input)
+		if prefix == "npub" {
+			pubkey, ok := value.(string)
+			if ok {
+				return pubkey, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("could not resolve key: %s", input)
 }
 
-type result struct {
-	Success       bool            `json:"success"`
-	MessageID     string          `json:"message_id,omitempty"`
-	Event         string          `json:"event_json,omitempty"`
-	Relays        []publishResult `json:"relays"`
-	EncryptedTo   string          `json:"encrypted_to"`
-	RetryableFail int             `json:"retryable_failures"`
-	FatalFail     int             `json:"fatal_failures"`
+func resolvePrivateKey(input string) (string, error) {
+	input = strings.TrimSpace(input)
+
+	if len(input) == 64 && isHex(input) {
+		return input, nil
+	}
+
+	if strings.HasPrefix(input, "nsec") {
+		prefix, value, _ := nip19.Decode(input)
+		if prefix == "nsec" {
+			secret, ok := value.(string)
+			if !ok {
+				return "", fmt.Errorf("invalid secret value")
+			}
+			return secret, nil
+		}
+	}
+
+	return "", fmt.Errorf("invalid private key format")
+}
+
+func derivePublicKeyFromPrivate(privkeyHex string) (string, error) {
+	evt := &nostr.Event{
+		Kind:      1,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Content:   "temp",
+	}
+	err := evt.Sign(privkeyHex)
+	if err != nil {
+		return "", err
+	}
+	return evt.PubKey, nil
+}
+
+func decryptMessage(privkey, pubkey, content string) (string, error) {
+	if content == "" {
+		return "", fmt.Errorf("empty content")
+	}
+	key, err := nip44.GenerateConversationKey(pubkey, privkey)
+	if err != nil {
+		return "", fmt.Errorf("generate key: %w", err)
+	}
+	return nip44.Decrypt(content, key)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func run(args []string) error {
@@ -125,29 +255,37 @@ func run(args []string) error {
 		return nil
 	}
 
-	if args[0] == "-h" || args[0] == "--help" {
-		printHelp()
-		return nil
-	}
-
-	if args[0] == "--version" {
-		fmt.Printf("%s version %s\n", appName, version)
-		return nil
-	}
-
 	opts, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
 
-	return sendDM(opts)
+	if opts.read {
+		return readMessages(opts)
+	}
+	return sendMessage(opts)
 }
 
-func sendDM(opts *options) error {
+func sendMessage(opts *options) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.wait)
 	defer cancel()
 
-	relays := defaultRelays
+	privkey, err := resolvePrivateKey(opts.key)
+	if err != nil {
+		return fmt.Errorf("invalid private key: %w", err)
+	}
+
+	recipientPubkey, err := resolveKey(opts.recipient)
+	if err != nil {
+		return fmt.Errorf("invalid recipient: %w", err)
+	}
+
+	relays := []string{
+		"wss://relay.damus.io",
+		"wss://relay.nostr.band",
+		"wss://nos.lol",
+	}
+
 	if opts.relays != "" {
 		relays = strings.Split(opts.relays, ",")
 		for i := range relays {
@@ -156,128 +294,180 @@ func sendDM(opts *options) error {
 	}
 
 	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "[ndm] Using key: %s...\n", opts.key[:20])
-		fmt.Fprintf(os.Stderr, "[ndm] Sending to: %s\n", opts.recipient)
-		fmt.Fprintf(os.Stderr, "[ndm] Relays: %v\n", relays)
+		fmt.Fprintf(os.Stderr, "[ndm] Using key: %s...\n", privkey[:20])
+		fmt.Fprintf(os.Stderr, "[ndm] Sending to: %s\n", recipientPubkey)
 	}
 
-	encrypted, err := encryptMessage(opts.key, opts.recipient, opts.message)
+	// Encrypt the message
+	conversationKey, err := nip44.GenerateConversationKey(recipientPubkey, privkey)
 	if err != nil {
-		return fmt.Errorf("encryption failed (exit code 2): %w", err)
+		return fmt.Errorf("failed to generate conversation key: %w", err)
 	}
-
-	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "[ndm] Encrypted message: %s\n", encrypted[:50])
-	}
-
-	eventJSON, err := createAndPublishEvent(ctx, opts.key, opts.recipient, encrypted, relays, opts.verbose)
+	encryptedContent, err := nip44.Encrypt(opts.message, conversationKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to encrypt: %w", err)
 	}
 
-	var event struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(eventJSON), &event); err != nil {
-		return fmt.Errorf("failed to parse event JSON: %w", err)
+	event := nostr.Event{
+		Kind:      nostr.KindEncryptedDirectMessage,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      nostr.Tags{{"p", recipientPubkey}},
+		Content:   encryptedContent,
 	}
 
-	results := []publishResult{}
+	err = event.Sign(privkey)
+	if err != nil {
+		return fmt.Errorf("failed to sign event: %w", err)
+	}
+
+	published := 0
 	for _, relay := range relays {
-		results = append(results, publishResult{
-			URL:    relay,
-			Status: "published",
-		})
+		rc, err := nostr.RelayConnect(ctx, relay)
+		if err != nil {
+			continue
+		}
+
+		err = rc.Publish(ctx, event)
+		rc.Close()
+		if err == nil {
+			published++
+		}
 	}
 
-	res := result{
-		Success:       true,
-		MessageID:     event.ID,
-		Event:         eventJSON,
-		Relays:        results,
-		EncryptedTo:   opts.recipient,
-		RetryableFail: 0,
-		FatalFail:     0,
+	if published == 0 {
+		return fmt.Errorf("failed to publish to any relay")
 	}
+
+	recipientNpub, _ := nip19.EncodePublicKey(recipientPubkey)
 
 	if opts.jsonOutput {
-		output, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Println(string(output))
+		fmt.Printf(`{"success":true,"message_id":"%s","encrypted_to":"%s","relays":%d}`, event.ID, recipientNpub, published)
 	} else {
 		fmt.Printf("✓ DM sent successfully\n")
 		fmt.Printf("  Message ID: %s\n", event.ID)
-		fmt.Printf("  To: %s\n", opts.recipient)
-		fmt.Printf("  Relays: %d\n", len(relays))
+		fmt.Printf("  To: %s\n", recipientNpub)
+		fmt.Printf("  Relays: %d\n", published)
 	}
 
 	return nil
 }
 
-func encryptMessage(key, recipient, message string) (string, error) {
-	cmd := exec.Command("nak", "encrypt",
-		"--sec", key,
-		"--recipient-pubkey", recipient,
-		message,
-	)
+func readMessages(opts *options) error {
+	ctx, cancel := context.WithTimeout(context.Background(), opts.wait)
+	defer cancel()
 
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	output, err := cmd.Output()
+	privkey, err := resolvePrivateKey(opts.key)
 	if err != nil {
-		if stderr.Len() > 0 {
-			return "", fmt.Errorf("nak encrypt error: %s", strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("invalid private key: %w", err)
+	}
+
+	pubkey, err := derivePublicKeyFromPrivate(privkey)
+	if err != nil {
+		return fmt.Errorf("invalid key: %w", err)
+	}
+
+	relays := []string{
+		"wss://relay.damus.io",
+		"wss://relay.nostr.band",
+		"wss://nos.lol",
+	}
+
+	if opts.relays != "" {
+		relays = strings.Split(opts.relays, ",")
+		for i := range relays {
+			relays[i] = strings.TrimSpace(relays[i])
 		}
-		return "", fmt.Errorf("nak encrypt failed: %w", err)
 	}
 
-	return strings.TrimSpace(string(output)), nil
-}
-
-func createAndPublishEvent(ctx context.Context, key, recipient, encryptedContent string, relays []string, verbose bool) (string, error) {
-	args := []string{
-		"event",
-		"--sec", key,
-		"-k", "4",
-		"-c", encryptedContent,
-		"-p", recipient,
-		"--quiet",
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "[ndm] Using key: %s...\n", privkey[:20])
+		fmt.Fprintf(os.Stderr, "[ndm] Pubkey: %s\n", pubkey)
+		fmt.Fprintf(os.Stderr, "[ndm] Fetching from: %v\n", relays)
 	}
 
-	args = append(args, relays...)
+	filter := nostr.Filter{
+		Kinds: []int{nostr.KindEncryptedDirectMessage},
+		Tags:  nostr.TagMap{"p": []string{pubkey}},
+		Limit: opts.count,
+	}
 
-	cmd := exec.CommandContext(ctx, "nak", args...)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	output, err := cmd.Output()
-	if err != nil {
-		if stderr.Len() > 0 {
-			errMsg := strings.TrimSpace(stderr.String())
-			if strings.Contains(errMsg, "auth") {
-				return "", fmt.Errorf("authentication failed: %s (exit code 3)", errMsg)
+	var events []*nostr.Event
+	for _, relay := range relays {
+		rc, err := nostr.RelayConnect(ctx, relay)
+		if err != nil {
+			if opts.verbose {
+				fmt.Fprintf(os.Stderr, "[ndm] Failed to connect to %s: %v\n", relay, err)
 			}
-			return "", fmt.Errorf("nak event error: %s (exit code 3)", errMsg)
+			continue
 		}
-		return "", fmt.Errorf("nak event failed: %w (exit code 3)", err)
+
+		eventsCh, err := rc.QueryEvents(ctx, filter)
+		if err != nil {
+			rc.Close()
+			continue
+		}
+
+		for evt := range eventsCh {
+			events = append(events, evt)
+			if len(events) >= opts.count {
+				break
+			}
+		}
+		rc.Close()
+		if len(events) >= opts.count {
+			break
+		}
 	}
 
-	eventJSON := strings.TrimSpace(string(output))
-	if verbose {
-		fmt.Fprintf(os.Stderr, "[ndm] Event: %s\n", eventJSON[:min(100, len(eventJSON))])
+	if len(events) == 0 {
+		fmt.Println("No messages found")
+		return nil
 	}
 
-	return eventJSON, nil
+	if opts.jsonOutput {
+		type msg struct {
+			ID        string `json:"id"`
+			From      string `json:"from"`
+			Content   string `json:"content"`
+			CreatedAt int64  `json:"created_at"`
+		}
+		var msgs []msg
+		for _, e := range events {
+			decrypted, _ := decryptMessage(privkey, e.PubKey, e.Content)
+			msgs = append(msgs, msg{
+				ID:        e.ID,
+				From:      e.PubKey,
+				Content:   decrypted,
+				CreatedAt: int64(e.CreatedAt),
+			})
+		}
+		out, _ := json.MarshalIndent(msgs, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Printf("Found %d messages:\n\n", len(events))
+		for i, e := range events {
+			decrypted, err := decryptMessage(privkey, e.PubKey, e.Content)
+			if err != nil {
+				fmt.Printf("[%d] From: %s\n", i+1, e.PubKey[:16]+"...")
+				fmt.Printf("    ID: %s\n", e.ID[:16]+"...")
+				fmt.Printf("    Content: (decrypt failed: %v)\n", err)
+				fmt.Printf("    Raw: %s\n\n", e.Content[:min(50, len(e.Content))]+"...")
+			} else {
+				fromNpub, _ := nip19.EncodePublicKey(e.PubKey)
+				fmt.Printf("[%d] From: %s\n", i+1, fromNpub[:20]+"...")
+				fmt.Printf("    ID: %s\n", e.ID[:16]+"...")
+				fmt.Printf("    Time: %s\n", time.Unix(int64(e.CreatedAt), 0).Format("2006-01-02 15:04:05"))
+				fmt.Printf("    Content: %s\n\n", decrypted)
+			}
+		}
+	}
+
+	return nil
 }
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		if strings.Contains(err.Error(), "missing required flag") {
-			fmt.Fprintf(os.Stderr, "\nRun '%s --help' for usage information.\n", appName)
-			os.Exit(1)
-		}
 		os.Exit(1)
 	}
 }

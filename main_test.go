@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -63,12 +62,27 @@ func TestParseArgs(t *testing.T) {
 		},
 		{
 			name:    "timeout flag",
-			args:    []string{"-k", "nsec1test", "-r", "npub1test", "-m", "hello", "-t", "60s"},
+			args:    []string{"-k", "nsec1test", "-r", "npub1test", "-m", "hello", "-t", "60"},
 			wantErr: false,
 		},
 		{
 			name:    "long form flags",
 			args:    []string{"--key", "nsec1test", "--recipient", "npub1test", "--message", "hello"},
+			wantErr: false,
+		},
+		{
+			name:    "read command",
+			args:    []string{"read", "-k", "nsec1test"},
+			wantErr: false,
+		},
+		{
+			name:    "inbox command",
+			args:    []string{"inbox", "-k", "nsec1test"},
+			wantErr: false,
+		},
+		{
+			name:    "count flag for read",
+			args:    []string{"read", "-k", "nsec1test", "-n", "5"},
 			wantErr: false,
 		},
 	}
@@ -93,17 +107,94 @@ func TestParseArgs(t *testing.T) {
 	}
 }
 
-func TestDefaultRelays(t *testing.T) {
-	opts, err := parseArgs([]string{"-k", "nsec1test", "-r", "npub1test", "-m", "hello"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestIsHex(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", true},
+		{"abcdef1234567890", true},
+		{"ABCDEF1234567890", true},
+		{"abcdefgh", false},
+		{"0123456789abcdef", true},
+		{"0123456789ABCDEF", true},
+		{"0", true},
+		{"g", false},
+		{"a", true},
 	}
 
-	// When no relay is specified, the sendDM function will use defaultRelays
-	// We can't directly test that here without mocking, but we can verify
-	// the parsing doesn't break
-	if opts.relays != "" {
-		t.Errorf("expected empty relays, got %q", opts.relays)
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := isHex(tt.input)
+			if got != tt.want {
+				t.Errorf("isHex(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvePrivateKey(t *testing.T) {
+	// Test with a valid hex key
+	validHex := "d898fd8d6ba74893a08d7a6a2d244348b55f8b4a0c417574ca19682d1577c0b1"
+	got, err := resolvePrivateKey(validHex)
+	if err != nil {
+		t.Errorf("resolvePrivateKey(%q) error = %v", validHex, err)
+	}
+	if got != validHex {
+		t.Errorf("resolvePrivateKey(%q) = %v, want %v", validHex, got, validHex)
+	}
+}
+
+func TestResolveKey(t *testing.T) {
+	// Test npub resolution
+	npub := "npub1c7a9q3r3s437pa87l6qrpxw2k6km0enqfdden9ldtcdsyqzmwfysdsu25t"
+	got, err := resolveKey(npub)
+	if err != nil {
+		t.Errorf("resolveKey(%q) error = %v", npub, err)
+	}
+	if len(got) != 64 {
+		t.Errorf("resolveKey(%q) = %v, want 64-char hex", npub, got)
+	}
+
+	// Test hex privkey - should derive pubkey
+	hexPriv := strings.Repeat("a", 64)
+	got, err = resolveKey(hexPriv)
+	if err != nil {
+		t.Errorf("resolveKey(%q) error = %v", hexPriv, err)
+	}
+	// Should be a derived pubkey, not the same as input
+	if got == hexPriv {
+		t.Errorf("resolveKey(%q) should derive pubkey, got same", hexPriv)
+	}
+}
+
+func TestDerivePublicKeyFromPrivate(t *testing.T) {
+	// Test with a known private key
+	privkey := "d898fd8d6ba74893a08d7a6a2d244348b55f8b4a0c417574ca19682d1577c0b1"
+	got, err := derivePublicKeyFromPrivate(privkey)
+	if err != nil {
+		t.Errorf("derivePublicKeyFromPrivate(%q) error = %v", privkey, err)
+	}
+	// Should be 64 char hex
+	if len(got) != 64 {
+		t.Errorf("derivePublicKeyFromPrivate(%q) = %v (len %d), want 64-char hex", privkey, got, len(got))
+	}
+
+	// Test that deriving from same privkey gives same pubkey
+	got2, _ := derivePublicKeyFromPrivate(privkey)
+	if got != got2 {
+		t.Errorf("derivePublicKeyFromPrivate(%q) not deterministic: got %v, want %v", privkey, got2, got)
+	}
+}
+
+func TestDecryptMessage(t *testing.T) {
+	// We'll test that encryption then decryption gives back original
+	// This is tested via the full round-trip in integration tests
+	// Just test error cases here
+
+	_, err := decryptMessage("", "abc", "test")
+	if err == nil {
+		t.Error("expected error for empty privkey")
 	}
 }
 
@@ -124,54 +215,13 @@ func TestCustomRelays(t *testing.T) {
 	}
 }
 
-func TestHelpFlag(t *testing.T) {
-	// Test that -h returns an error (flag: help requested) which is expected behavior
-	_, err := parseArgs([]string{"-h"})
-	if err == nil {
-		t.Error("expected error for -h but got nil")
-	}
-}
-
-func TestVersionFlag(t *testing.T) {
-	// Test that --version is handled by main
-	// We just verify it doesn't panic
-	if os.Args[0] == "" {
-		t.Skip("skipping in test context")
-	}
-}
-
-func TestNsecFormats(t *testing.T) {
-	formats := []string{
-		"nsec1mzv0mrtt5ayf8gyd0f4z6fzrfz64lz62p3qh2ax2r95z69thczcsps889v",
-		"d898fd8d6ba74893a08d7a6a2d244348b55f8b4a0c417574ca19682d1577c0b1",
+func TestCountFlag(t *testing.T) {
+	opts, err := parseArgs([]string{"read", "-k", "nsec1test", "-n", "5"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, format := range formats {
-		_, err := parseArgs([]string{
-			"-k", format,
-			"-r", "npub1c7a9q3r3s437pa87l6qrpxw2k6km0enqfdden9ldtcdsyqzmwfysdsu25t",
-			"-m", "hello",
-		})
-		if err != nil {
-			t.Errorf("failed to parse %s: %v", format, err)
-		}
-	}
-}
-
-func TestNpubFormats(t *testing.T) {
-	formats := []string{
-		"npub1c7a9q3r3s437pa87l6qrpxw2k6km0enqfdden9ldtcdsyqzmwfysdsu25t",
-		"c7ba5044718563e0f4fefe803099cab6adb7e6604b5b9997ed5e1b02005b7249",
-	}
-
-	for _, format := range formats {
-		_, err := parseArgs([]string{
-			"-k", "nsec1mzv0mrtt5ayf8gyd0f4z6fzrfz64lz62p3qh2ax2r95z69thczcsps889v",
-			"-r", format,
-			"-m", "hello",
-		})
-		if err != nil {
-			t.Errorf("failed to parse recipient %s: %v", format, err)
-		}
+	if opts.count != 5 {
+		t.Errorf("expected count 5, got %d", opts.count)
 	}
 }
